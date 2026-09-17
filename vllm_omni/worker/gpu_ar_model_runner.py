@@ -541,6 +541,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # 2. Destroy talker MTP CUDA graph wrapper to release captured graphs.
         if hasattr(self, "talker_mtp") and self.talker_mtp is not None:
             self.talker_mtp = None
+        # Drop the unwrapped handle too: it is only needed while requests are
+        # in flight, and keeping it would hold the model past self.model = None.
+        if hasattr(self, "_talker_mtp_unwrapped"):
+            self._talker_mtp_unwrapped = None
         self.has_talker_mtp = False
 
         # 3. Clear GPU-side buffers (small tensors, but every MiB helps).

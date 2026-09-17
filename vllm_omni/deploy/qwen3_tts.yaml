@@ -9,6 +9,13 @@
 #   * Stage 1 (code2wav) sets max_num_batched_tokens=65536 for correctness:
 #     codec prefill length (Q * num_frames) exceeds the 32k default.
 #   * Stage 0 does not set enforce_eager — talker runs cudagraph by default.
+#     Requests that carry an explicit ``seed`` still bypass the talker's
+#     captured residual-codebook graph and run it eagerly, because a replayed
+#     graph draws from the RNG stream baked in at capture time and would ignore
+#     the request seed. The seed then pins the generated codec frames at a small
+#     latency cost; unseeded requests keep the replay fast path. Byte-identical
+#     waveforms additionally need a fixed decode window (see the
+#     Reproducibility section of docs/serving/speech_api.md).
 #     Stage 1 defaults to false so Code2Wav can use its inner cudagraph;
 #     set true to disable that path in eager mode.
 async_chunk: true

@@ -255,6 +255,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         if talker_mtp is None:
             return
         self.talker_mtp = talker_mtp  # type: ignore[assignment]
+        # Kept unwrapped: explicitly seeded requests bypass the captured graph in
+        # _talker_mtp_forward, because a captured graph cannot consume the
+        # per-request generator that carries the seed.
+        self._talker_mtp_unwrapped = talker_mtp
         self.has_talker_mtp = True
         cudagraph_mode = self.compilation_config.cudagraph_mode
         assert cudagraph_mode is not None
@@ -1917,11 +1921,40 @@ class OmniGPUModelRunner(GPUModelRunner):
             max_num_scheduled_tokens=1,
             use_cascade_attn=False,
         )
+
+        def _explicit_talker_seed(req_id: str) -> int | None:
+            sampling_params = getattr(self.requests[req_id], "sampling_params", None)
+            extra_args = getattr(sampling_params, "extra_args", None) if sampling_params is not None else None
+            seed = None
+            if isinstance(extra_args, dict):
+                seed = extra_args.get("tts_local_seed")
+            return int(seed) if seed is not None else None
+
+        # A captured talker_mtp graph cannot honor a per-request seed: it is
+        # captured once during load_model with no generator argument, so every
+        # replay draws from the single RNG stream baked in at capture time and
+        # the request's ``tts_local_seed`` never reaches the sampler. Models
+        # whose talker_mtp samples with per-request generators — the same static
+        # capability that lets a seeded batch stay batched (#4883) — therefore
+        # run it eagerly whenever a row carries a seed, so an explicit request
+        # ``seed`` really pins the residual codebooks. Unseeded requests, and
+        # models that never consume a request generator, keep the replay path.
+        mtp_is_graph_wrapped = isinstance(self.talker_mtp, current_omni_platform.get_graph_wrapper_cls())
+        mtp_samples_with_request_generators = bool(
+            getattr(self.model, "talker_mtp_accepts_per_row_generators", False)
+        )
+        bypass_mtp_graph = (
+            mtp_is_graph_wrapped
+            and mtp_samples_with_request_generators
+            and any(_explicit_talker_seed(req_id) is not None for req_id in decode_req_ids)
+        )
+
         # Force eager for unwrapped code predictors (AR loops / multinomial).
         # When talker_mtp is not wrapped by the platform's full-graph wrapper,
         # it manages its own device graphs internally (code_predictor has its
-        # own bucket sizes).
-        if not isinstance(self.talker_mtp, current_omni_platform.get_graph_wrapper_cls()):
+        # own bucket sizes). The same applies to the bypass above: a replayed
+        # graph would ignore the per-row generators passed below.
+        if not mtp_is_graph_wrapped or bypass_mtp_graph:
             _cudagraph_mode = CUDAGraphMode.NONE
             num_tokens_padded = decode_batch_size
         else:
@@ -1933,14 +1966,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         subtalker_params = getattr(self.vllm_config.model_config, "subtalker_sampling_params", None)
         if not isinstance(subtalker_params, dict):
             subtalker_params = {}
-
-        def _explicit_talker_seed(req_id: str) -> int | None:
-            sampling_params = getattr(self.requests[req_id], "sampling_params", None)
-            extra_args = getattr(sampling_params, "extra_args", None) if sampling_params is not None else None
-            seed = None
-            if isinstance(extra_args, dict):
-                seed = extra_args.get("tts_local_seed")
-            return int(seed) if seed is not None else None
 
         def _row_generator(req_id: str) -> torch.Generator | None:
             seed = _explicit_talker_seed(req_id)
@@ -1967,7 +1992,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         if (
             decode_batch_size > 1
             and any(generator is not None for generator in row_generators)
-            and not getattr(self.model, "talker_mtp_accepts_per_row_generators", False)
+            and not mtp_samples_with_request_generators
         ):
             # A torch.Generator is a single stream. Using one generator for a
             # multi-row batch would make explicitly-seeded requests depend on
@@ -2007,10 +2032,17 @@ class OmniGPUModelRunner(GPUModelRunner):
             talker_kwargs["req_infos"] = [
                 self.model_intermediate_buffer.setdefault(req_id, {}) for req_id in decode_req_ids
             ]
+        mtp_callable = self.talker_mtp
+        if bypass_mtp_graph:
+            # Call the module directly: a replayed graph would ignore the
+            # per-row generators built above and drop the request seed again.
+            mtp_callable = getattr(self, "_talker_mtp_unwrapped", None)
+            if mtp_callable is None:
+                mtp_callable = self.talker_mtp
         with current_omni_platform.set_forward_context(
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
-            req_embeds, code_predictor_codes = self.talker_mtp(
+            req_embeds, code_predictor_codes = mtp_callable(
                 req_input_ids,
                 req_embeds,
                 last_talker_hidden,

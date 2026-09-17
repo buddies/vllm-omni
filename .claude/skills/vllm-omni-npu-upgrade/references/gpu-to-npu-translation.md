@@ -114,6 +114,14 @@ if not isinstance(self.talker_mtp, ACLGraphWrapper):
     _cudagraph_mode = CUDAGraphMode.NONE
 ```
 
+The GPU `_talker_mtp_forward` additionally bypasses the wrapper (calling
+`self._talker_mtp_unwrapped`, forced `CUDAGraphMode.NONE`, unpadded batch) when a row
+carries an explicit seed and the model declares
+`talker_mtp_accepts_per_row_generators`. A captured MTP graph is replayed from the RNG
+stream baked in at capture time, so replaying it would silently drop the request seed.
+Keep that bypass when porting the method to NPU.
+
+
 ## Device Operations
 
 ### Synchronization

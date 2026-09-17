@@ -89,6 +89,8 @@ def test_talker_mtp_uses_graph_for_legacy_or_explicit_safe_model(monkeypatch, ta
     OmniGPUModelRunner._init_talker_mtp(runner)
 
     assert runner.talker_mtp is wrapped
+    # The unwrapped handle is retained for the seeded-request bypass.
+    assert runner._talker_mtp_unwrapped is runner.model.talker_mtp
 
 
 class DummyBuffer:
@@ -197,6 +199,15 @@ class CaptureTalkerMTP(torch.nn.Module):
         return req_embeds, codes
 
 
+class _CapturedGraphMTP(CaptureTalkerMTP):
+    """Stand-in for the captured talker_mtp CUDA graph.
+
+    ``OmniGPUModelRunner`` identifies the wrapped callable by ``isinstance``
+    against ``current_omni_platform.get_graph_wrapper_cls()``, which the tests
+    monkeypatch to this class.
+    """
+
+
 class StrictMRoPEModel:
     def get_mrope_input_positions(self, input_tokens, mm_features):
         raise NotImplementedError
@@ -210,6 +221,13 @@ class FlexibleMRoPEModel:
 @contextmanager
 def _noop_forward_context(*args, **kwargs):
     """A no-op context manager to replace vLLM forward context in CPU tests."""
+    yield
+
+
+@contextmanager
+def _recording_forward_context(records, *args, **kwargs):
+    """A no-op forward context that records the runtime mode it was given."""
+    records.append(kwargs)
     yield
 
 
@@ -500,6 +518,141 @@ def test_talker_mtp_forward_batches_seeded_requests_for_opted_in_models(monkeypa
     OmniGPUModelRunner._talker_mtp_forward(runner, ["r1"], inputs_embeds)
     assert set(runner._talker_mtp_generators) == {"r1"}
     assert runner.talker_mtp.calls[2]["generator"] is row_generators[0]
+
+
+def _install_captured_mtp(monkeypatch, runner, *, per_row_generators: bool) -> None:
+    """Wire a runner whose ``talker_mtp`` plays the captured-graph role.
+
+    ``runner.talker_mtp`` is the (mocked) graph wrapper and
+    ``runner._talker_mtp_unwrapped`` the eager module the seeded bypass must
+    call, so the two paths stay distinguishable.
+    """
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    monkeypatch.setattr(mod.current_omni_platform, "get_graph_wrapper_cls", lambda: _CapturedGraphMTP)
+    runner.talker_mtp = _CapturedGraphMTP()
+    runner._talker_mtp_unwrapped = CaptureTalkerMTP()
+    runner.model = SimpleNamespace(
+        talker_mtp_output_key=("codes", "audio"),
+        talker_mtp_accepts_per_row_generators=per_row_generators,
+    )
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))
+
+    def fake_determine(self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, use_cascade_attn):
+        # Padded on purpose: only the graph replay path may use the padding.
+        return (mod.CUDAGraphMode.FULL, SimpleNamespace(num_tokens=int(num_tokens) + 1), None, None, None)
+
+    monkeypatch.setattr(
+        runner,
+        "_determine_batch_execution_and_padding",
+        fake_determine.__get__(runner, type(runner)),
+    )
+
+
+def test_talker_mtp_forward_bypasses_captured_graph_for_seeded_rows(monkeypatch):
+    """An explicit request seed must reach the residual sampler (#4923).
+
+    A captured talker_mtp graph is replayed from the single RNG stream baked in
+    at capture time, so replaying it drops ``tts_local_seed``. Requests that
+    carry one therefore run the unwrapped module eagerly — that is what makes
+    same-seed audio reproducible.
+    """
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    context_kwargs: list[dict] = []
+    monkeypatch.setattr(
+        mod.current_omni_platform,
+        "set_forward_context",
+        lambda *args, **kwargs: _recording_forward_context(context_kwargs, *args, **kwargs),
+    )
+
+    runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
+    runner.requests["r1"].sampling_params = SimpleNamespace(seed=42, extra_args={"tts_local_seed": 42})
+    _install_captured_mtp(monkeypatch, runner, per_row_generators=True)
+
+    inputs_embeds = torch.zeros((6, 4), dtype=torch.float32)
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1", "r2"], inputs_embeds)
+
+    # The captured graph is not replayed...
+    assert runner.talker_mtp.calls == []
+    # ...the unwrapped module runs eagerly, batched, with a private generator
+    # for the seeded row and the global RNG for the unseeded one.
+    assert [call["batch_size"] for call in runner._talker_mtp_unwrapped.calls] == [2]
+    row_generators = runner._talker_mtp_unwrapped.calls[0]["generators"]
+    assert len(row_generators) == 2
+    assert row_generators[0] is not None
+    assert row_generators[1] is None
+    # Eager, so the graph mode is downgraded for this call.
+    assert context_kwargs[-1]["cudagraph_runtime_mode"] is mod.CUDAGraphMode.NONE
+
+
+def test_talker_mtp_forward_keeps_captured_graph_for_unseeded_rows(monkeypatch):
+    """Unseeded traffic keeps the replay fast path."""
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    context_kwargs: list[dict] = []
+    monkeypatch.setattr(
+        mod.current_omni_platform,
+        "set_forward_context",
+        lambda *args, **kwargs: _recording_forward_context(context_kwargs, *args, **kwargs),
+    )
+
+    runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
+    _install_captured_mtp(monkeypatch, runner, per_row_generators=True)
+
+    inputs_embeds = torch.zeros((6, 4), dtype=torch.float32)
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1", "r2"], inputs_embeds)
+
+    assert [call["batch_size"] for call in runner.talker_mtp.calls] == [2]
+    assert runner.talker_mtp.calls[0]["generator"] is None
+    assert runner.talker_mtp.calls[0]["generators"] is None
+    assert runner._talker_mtp_unwrapped.calls == []
+    assert context_kwargs[-1]["cudagraph_runtime_mode"] is mod.CUDAGraphMode.FULL
+
+
+def test_talker_mtp_forward_bypasses_graph_with_per_row_generators(monkeypatch):
+    """A per-row-capable model stays batched when it bypasses the graph (#4883)."""
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
+
+    runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
+    runner.requests["r1"].sampling_params = SimpleNamespace(seed=11, extra_args={"tts_local_seed": 11})
+    runner.requests["r2"].sampling_params = SimpleNamespace(seed=22, extra_args={"tts_local_seed": 22})
+    _install_captured_mtp(monkeypatch, runner, per_row_generators=True)
+
+    inputs_embeds = torch.zeros((6, 4), dtype=torch.float32)
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1", "r2"], inputs_embeds)
+
+    assert runner.talker_mtp.calls == []
+    assert [call["batch_size"] for call in runner._talker_mtp_unwrapped.calls] == [2]
+    row_generators = runner._talker_mtp_unwrapped.calls[0]["generators"]
+    assert all(generator is not None for generator in row_generators)
+    assert row_generators[0] is not row_generators[1]
+
+
+def test_talker_mtp_forward_keeps_graph_when_model_cannot_use_request_seeds(monkeypatch):
+    """A model that never consumes a request generator keeps the graph replay.
+
+    Qwen3-Omni's code predictor samples from the global RNG, so bypassing the
+    graph for it would cost latency without making the audio reproducible.
+    """
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
+
+    runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
+    runner.requests["r1"].sampling_params = SimpleNamespace(seed=11, extra_args={"tts_local_seed": 11})
+    runner.requests["r2"].sampling_params = SimpleNamespace(seed=22, extra_args={"tts_local_seed": 22})
+    _install_captured_mtp(monkeypatch, runner, per_row_generators=False)
+
+    inputs_embeds = torch.zeros((6, 4), dtype=torch.float32)
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1", "r2"], inputs_embeds)
+
+    assert runner._talker_mtp_unwrapped.calls == []
+    # The single-generator model keeps its scalar loop, served by the graph.
+    assert len(runner.talker_mtp.calls) == 2
+    assert all(call["generator"] is not None for call in runner.talker_mtp.calls)
 
 
 def test_update_intermediate_buffer_writes_to_buffer_and_setattr(monkeypatch):

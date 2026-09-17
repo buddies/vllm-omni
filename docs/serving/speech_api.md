@@ -144,12 +144,31 @@ Content-Type: application/json
 | `language` | string | "Auto" | Language (see supported languages below) |
 | `instructions` | string | "" | Voice style/emotion instructions |
 | `max_new_tokens` | integer | 2048 | Maximum tokens to generate |
+| `seed` | integer | null | Random seed for the Talker stage. Pins the generated codec frames for a given input; see [Reproducibility](#reproducibility). |
 | `initial_codec_chunk_frames` | integer | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
 | `non_streaming_mode` | bool | null | Qwen3-TTS prompt construction mode override. Does not affect HTTP response streaming or async-chunk pipelining. When null, Qwen3-TTS uses model defaults: Base=false, CustomVoice/VoiceDesign=true. |
 | `stream` | bool | false | When true, stream OpenAI `speech.audio.*` SSE events (requires `response_format="pcm"` or `"wav"`). For raw PCM/WAV byte streaming, set `stream_format="audio"`. |
 | `stream_format` | string | null | Streaming output format. `"audio"` streams raw audio bytes as they are decoded; `"sse"` streams OpenAI `speech.audio.*` Server-Sent Events. If omitted, `stream=true` selects SSE and `stream=false` remains non-streaming. See [Response Format](#response-format). |
 
 **Supported languages:** Only applicable to Qwen3-TTS. Derived from the model configuration (`talker_config.codec_language_id` in the checkpoint's `config.json`), plus `Auto`, which is always accepted. Official Qwen3-TTS checkpoints support: Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian.
+
+#### Reproducibility
+
+Set `seed` to pin a request: the same `input`, `voice`, `instructions`, and `seed` produce
+the same codec frames across calls and restarts. This also holds for Qwen3-TTS, whose
+Talker predicts residual codebooks inside an AR loop: a captured CUDA graph for that loop
+is replayed from the single RNG stream baked in at capture time, so a request carrying an
+explicit seed runs that module eagerly instead (unseeded requests keep the replay fast
+path). Seeded requests therefore trade a small amount of per-request latency for
+reproducibility.
+
+Sample-exact waveforms additionally require a deterministic decode window: with
+`async_chunk: true` the codec stage derives its first chunk size from live server load when
+`initial_codec_chunk_frames` is unset and no fixed/adaptive chunk ramp is configured, and
+different chunk boundaries can move the waveform at the seams. The bundled
+`qwen3_tts.yaml` pins `initial_codec_chunk_frames: 1`, so a default Qwen3-TTS deploy is
+deterministic; keep that pin (or serve with `--no-async-chunk`, which decodes each request
+in one pass) when byte-identical audio matters.
 
 #### Voice Clone Parameters (Base task)
 
